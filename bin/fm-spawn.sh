@@ -839,7 +839,9 @@ case "$ARG3" in
 esac
 
 case "$HARNESS" in
-  pi|pi-signed) LAUNCH="FM_PI_HARNESS=$HARNESS $LAUNCH" ;;
+  # PI_TELEMETRY=0 is Pi's documented install-telemetry override (pilot canon
+  # requirement); it makes no claim about runtime/provider telemetry.
+  pi|pi-signed) LAUNCH="PI_TELEMETRY=0 FM_PI_HARNESS=$HARNESS $LAUNCH" ;;
 esac
 
 # pi-signed is an explicitly selected executable identity, not an alias that may
