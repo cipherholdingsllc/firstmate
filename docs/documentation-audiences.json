@@ -225,6 +225,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/cmux-war-room.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/codex-app-backend.md",
       "audience": "operator-current"
     },
@@ -322,6 +326,10 @@
     },
     {
       "path": "docs/verification/dispatch-auth.md",
+      "audience": "maintainer-verification"
+    },
+    {
+      "path": "docs/verification/muse.md",
       "audience": "maintainer-verification"
     },
     {
