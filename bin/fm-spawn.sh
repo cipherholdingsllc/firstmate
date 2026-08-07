@@ -918,7 +918,9 @@ case "$ARG3" in
 esac
 
 case "$HARNESS" in
-  pi|pi-signed) LAUNCH="FM_PI_HARNESS=$HARNESS $LAUNCH" ;;
+  # PI_TELEMETRY=0 is Pi's documented install-telemetry override (pilot canon
+  # requirement); it makes no claim about runtime/provider telemetry.
+  pi|pi-signed) LAUNCH="PI_TELEMETRY=0 FM_PI_HARNESS=$HARNESS $LAUNCH" ;;
 esac
 
 # muse is verified as a CREWMATE/SCOUT adapter only. A secondmate is a firstmate
