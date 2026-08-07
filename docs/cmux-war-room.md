@@ -10,6 +10,7 @@ Firstmate's supervised crewmate spawn keeps one cmux workspace with one surface 
 Nothing on this page changes that default, and none of it runs inside `bin/fm-spawn.sh` or the recovery path.
 A war room is a manual, operator-driven session for watching several already-running panes at once, built with the same `cmux` CLI Firstmate already depends on.
 `bin/fm-cmux-war-room.sh` is a thin standalone helper for that manual session; it is never invoked by spawn or recovery.
+Flat agent-to-agent messaging is intentionally out of scope; crewmate communication flows through firstmate under the hard rule in `AGENTS.md`.
 
 ## Prerequisites
 
@@ -18,17 +19,41 @@ Same as [`cmux-backend.md`](cmux-backend.md#setup): cmux 0.64 or newer, `jq`, an
 
 ## Build the grid
 
-Capture every ref returned at creation time and never guess a short `surface:N` handle later; short refs renumber as panes open and close.
+Capture refs with a before/after `cmux tree --all --json` diff.
+`new-workspace` does not provide a JSON response on the supported cmux CLI, so never pass it an unverified `--json` flag.
 
 Stepwise splits:
 
 ```sh
-WS=$(cmux new-workspace --name war-room --cwd "$PWD" --focus false --json | jq -r '.workspace_id // .ref')
+before=$(mktemp)
+after=$(mktemp)
+cmux tree --all --json >"$before"
+cmux new-workspace --name war-room --cwd "$PWD" --focus false
+cmux tree --all --json >"$after"
+WS=$(jq -r --slurpfile before "$before" --slurpfile after "$after" '
+  ([ $after[0].windows[].workspaces[].id ] - [ $before[0].windows[].workspaces[].id ])
+  | .[0] // empty')
+rm -f "$before" "$after"
+[ -n "$WS" ] || { echo "war-room: failed to capture non-empty workspace id" >&2; exit 1; }
+cmux workspace-action --action set-color --workspace "$WS" --color Purple
 A=$(cmux list-panes --workspace "$WS" --json --id-format both | jq -r '.panes[0].surface_ids[0] // .panes[0].surface_refs[0]')
+[ -n "$A" ] || { echo "war-room: failed to capture non-empty lead surface ref" >&2; exit 1; }
 
-B=$(cmux new-split right --workspace "$WS" --surface "$A" --json | jq -r '.surface_id // .ref')
-C=$(cmux new-split down  --workspace "$WS" --surface "$A" --json | jq -r '.surface_id // .ref')
-D=$(cmux new-split down  --workspace "$WS" --surface "$B" --json | jq -r '.surface_id // .ref')
+before=$(cmux tree --workspace "$WS" --json)
+cmux new-split right --workspace "$WS" --surface "$A"
+after=$(cmux tree --workspace "$WS" --json)
+B=$(jq -r --argjson before "$before" --argjson after "$after" '[$after.windows[].workspaces[].panes[].surfaces[]?.ref] - [$before.windows[].workspaces[].panes[].surfaces[]?.ref] | .[0] // empty')
+[ -n "$B" ] || { echo "war-room: failed to capture non-empty build surface ref" >&2; exit 1; }
+before=$(cmux tree --workspace "$WS" --json)
+cmux new-split down --workspace "$WS" --surface "$A"
+after=$(cmux tree --workspace "$WS" --json)
+C=$(jq -r --argjson before "$before" --argjson after "$after" '[$after.windows[].workspaces[].panes[].surfaces[]?.ref] - [$before.windows[].workspaces[].panes[].surfaces[]?.ref] | .[0] // empty')
+[ -n "$C" ] || { echo "war-room: failed to capture non-empty review surface ref" >&2; exit 1; }
+before=$(cmux tree --workspace "$WS" --json)
+cmux new-split down --workspace "$WS" --surface "$B"
+after=$(cmux tree --workspace "$WS" --json)
+D=$(jq -r --argjson before "$before" --argjson after "$after" '[$after.windows[].workspaces[].panes[].surfaces[]?.ref] - [$before.windows[].workspaces[].panes[].surfaces[]?.ref] | .[0] // empty')
+[ -n "$D" ] || { echo "war-room: failed to capture non-empty fourth surface ref" >&2; exit 1; }
 ```
 
 Declarative equivalent, one call instead of four:
@@ -48,6 +73,11 @@ cmux new-workspace --name war-room --cwd "$PWD" --focus false --layout '{
 ```
 
 Always scope splits with `--workspace` when more than one workspace exists, so a split never lands in the wrong window.
+
+## Spatial convention
+
+Keep the lead surface on the left and worker surfaces on the right.
+The convention makes the lead easy to find while preserving a stable scan direction as workers are added.
 
 ## Label and color the fleet
 
@@ -74,7 +104,7 @@ This file is a captain-private convention, not something Firstmate ships or read
 bin/fm-cmux-war-room.sh color-for-harness claude
 ```
 
-Prints the configured color for that harness, or `Grey` with a stderr note when the file or the key is absent, so a missing config never blocks the war room.
+Prints the configured color for that harness, or `Charcoal` with a stderr note when the file or the key is absent, so a missing config never blocks the war room.
 That output is a cmux workspace color name (or hex), the same value `workspace-action --action set-color` accepts, not the raw ANSI SGR number `banner --color` writes into the pane; the two commands color two different surfaces (sidebar workspace versus in-pane text) and do not share a value.
 
 ## Observe
@@ -82,16 +112,17 @@ That output is a cmux workspace color name (or hex), the same value `workspace-a
 ```sh
 cmux tree --all --json
 cmux list-panes --workspace "$WS" --json --id-format both
-cmux read-screen --surface "$A" --scrollback --lines 80
+cmux read-screen --workspace "$WS" --surface "$A" --scrollback --lines 80
 ```
 
-`read-screen` returns an internal error against a genuinely fresh surface until something has been written to it; re-tree with `list-panes` for structural readiness instead of retrying a content read.
+`read-screen --workspace "$WS"` is deliberately scoped; never omit the workspace when reading a captured surface ref.
+It returns an internal error against a genuinely fresh surface until something has been written to it; re-tree with `list-panes --workspace "$WS"` for structural readiness instead of retrying a content read.
 
 ## Capture UUIDs, never cache short refs
 
 ```sh
-cmux identify --json
-cmux list-workspaces --json --id-format both
+cmux tree --all --json
+cmux list-panes --workspace "$WS" --json --id-format both
 ```
 
 Short refs like `surface:3` renumber as the tree changes.
@@ -107,17 +138,29 @@ bin/fm-cmux-war-room.sh teardown-surfaces --workspace "$WS" --keep "$A" --close-
 ```
 
 `--keep` leaves one surface open; cmux refuses to close a workspace's last surface directly, so leaving one (or omitting `--close-workspace` and closing the workspace yourself afterward) avoids that refusal.
+Every `close-surface` and `close-workspace` operation must carry `--workspace "$WS"`; an unscoped close can act on the caller's workspace.
 Without `--keep`, every surface in the workspace closes, matching the [`cmux-backend.md`](cmux-backend.md#current-operation-and-safety) "last surface" and "only workspace in window" behavior that `close-workspace` already handles.
 
 Manual equivalent, for reference:
 
 ```sh
 cmux list-panes --workspace "$WS" --json --id-format both \
-  | jq -r '[.panes[].surface_ids[]?, .panes[].surface_refs[]?] | unique | .[]' \
-  | while read -r S; do cmux close-surface --surface "$S"; done
+  | jq -r '[(.panes[]?.surface_ids[]?)] as $ids | if ($ids | length) > 0 then $ids else [(.panes[]?.surface_refs[]?)] end | unique | .[]' \
+  | while read -r S; do [ -n "$S" ] || { echo "empty surface ref" >&2; exit 1; }; cmux close-surface --workspace "$WS" --surface "$S"; done
 cmux close-workspace --workspace "$WS"
 ```
 
+## Retire a corpse workspace
+
+If `list-panes --workspace "$WS" --json` returns `"panes": []`, the workspace is a zero-surface corpse.
+Retire only that confirmed corpse with:
+
+```sh
+bin/fm-cmux-war-room.sh retire-corpse --workspace "$WS"
+```
+
+The helper refuses to retire a workspace that still contains panes and always scopes the close to the captured workspace ref.
+
 ## Regression entry points
 
-`bin/fm-cmux-war-room.sh` has no automated test in this pass; it is exercised manually against a live cmux app the same way [`cmux-backend.md`](cmux-backend.md#regression-entry-points) documents for the backend adapter.
+The colocated `tests/fm-cmux-war-room.test.sh` regression invokes teardown from a different caller workspace and asserts every close is scoped to the target.
