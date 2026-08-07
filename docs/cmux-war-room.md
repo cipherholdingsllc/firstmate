@@ -10,6 +10,7 @@ firstmate's supervised crewmate spawn keeps one cmux workspace with one surface 
 Nothing on this page changes that default, and none of it runs inside `bin/fm-spawn.sh` or the recovery path.
 A war room is a manual, operator-driven session for watching several already-running panes at once, built with the same `cmux` CLI firstmate already depends on.
 `bin/fm-cmux-war-room.sh` is a thin standalone helper for that manual session; it is never invoked by spawn or recovery.
+Flat agent-to-agent messaging is intentionally out of scope; crewmate communication flows through firstmate under the hard rule in `AGENTS.md`.
 
 ## Prerequisites
 
@@ -34,6 +35,7 @@ WS=$(jq -r --slurpfile before "$before" --slurpfile after "$after" '
   | .[0] // empty')
 rm -f "$before" "$after"
 [ -n "$WS" ] || { echo "war-room: failed to capture non-empty workspace id" >&2; exit 1; }
+cmux workspace-action --action set-color --workspace "$WS" --color Purple
 A=$(cmux list-panes --workspace "$WS" --json --id-format both | jq -r '.panes[0].surface_ids[0] // .panes[0].surface_refs[0]')
 [ -n "$A" ] || { echo "war-room: failed to capture non-empty lead surface ref" >&2; exit 1; }
 
@@ -71,6 +73,11 @@ cmux new-workspace --name war-room --cwd "$PWD" --focus false --layout '{
 ```
 
 Always scope splits with `--workspace` when more than one workspace exists, so a split never lands in the wrong window.
+
+## Spatial convention
+
+Keep the lead surface on the left and worker surfaces on the right.
+The convention makes the lead easy to find while preserving a stable scan direction as workers are added.
 
 ## Label and color the fleet
 
