@@ -10,6 +10,7 @@
 #   fm-cmux-war-room.sh banner --surface <ref> --label <text> [--color <name-or-hex>]
 #   fm-cmux-war-room.sh color-for-harness <harness>
 #   fm-cmux-war-room.sh teardown-surfaces --workspace <ref> [--keep <surface-ref>] [--close-workspace]
+#   fm-cmux-war-room.sh retire-corpse --workspace <ref>
 #   fm-cmux-war-room.sh --help
 #
 # banner            renames the pane tab and writes a colored ANSI banner line
@@ -56,6 +57,14 @@ fm_cmux_war_room_require_jq() {
   }
 }
 
+fm_cmux_war_room_require_ref() {
+  local name=$1 value=${2:-}
+  [ -n "$value" ] || {
+    echo "fm-cmux-war-room: $name is empty; refusing to use the caller's current workspace" >&2
+    return 1
+  }
+}
+
 fm_cmux_war_room_banner() {
   local surface="" label="" color="36" cmux_bin
   while [ $# -gt 0 ]; do
@@ -83,8 +92,8 @@ fm_cmux_war_room_color_for_harness() {
     color=$(jq -r --arg h "$harness" '.workspace_colors[$h] // empty' "$file")
   fi
   if [ -z "$color" ]; then
-    echo "fm-cmux-war-room: no color configured for '$harness' in $file, using default Grey" >&2
-    color="Grey"
+    echo "fm-cmux-war-room: no color configured for '$harness' in $file, using default Charcoal" >&2
+    color="Charcoal"
   fi
   printf '%s\n' "$color"
 }
@@ -99,18 +108,19 @@ fm_cmux_war_room_teardown_surfaces() {
       *) echo "fm-cmux-war-room teardown-surfaces: unknown argument: $1" >&2; return 1 ;;
     esac
   done
-  [ -n "$workspace" ] || { echo "fm-cmux-war-room teardown-surfaces: --workspace is required" >&2; return 1; }
+  fm_cmux_war_room_require_ref "teardown-surfaces --workspace" "$workspace" || return 1
   cmux_bin=$(fm_cmux_war_room_bin) || return 1
   fm_cmux_war_room_require_jq || return 1
 
   local surfaces
   surfaces=$("$cmux_bin" list-panes --workspace "$workspace" --json --id-format both \
-    | jq -r '[.panes[].surface_ids[]?, .panes[].surface_refs[]?] | unique | .[]')
+    | jq -r '[(.panes[]?.surface_ids[]?)] as $ids | if ($ids | length) > 0 then $ids else [(.panes[]?.surface_refs[]?)] end | unique | .[]')
 
   while IFS= read -r surface; do
     [ -n "$surface" ] || continue
     [ "$surface" = "$keep" ] && continue
-    "$cmux_bin" close-surface --surface "$surface"
+    fm_cmux_war_room_require_ref "surface ref" "$surface" || return 1
+    "$cmux_bin" close-surface --workspace "$workspace" --surface "$surface"
   done <<EOF
 $surfaces
 EOF
@@ -120,6 +130,25 @@ EOF
   fi
 }
 
+fm_cmux_war_room_retire_corpse() {
+  local workspace="" cmux_bin panes
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --workspace) workspace=${2:-}; shift 2 ;;
+      *) echo "fm-cmux-war-room retire-corpse: unknown argument: $1" >&2; return 1 ;;
+    esac
+  done
+  fm_cmux_war_room_require_ref "retire-corpse --workspace" "$workspace" || return 1
+  cmux_bin=$(fm_cmux_war_room_bin) || return 1
+  fm_cmux_war_room_require_jq || return 1
+  panes=$("$cmux_bin" list-panes --workspace "$workspace" --json)
+  if [ "$(printf '%s' "$panes" | jq '.panes | length')" -ne 0 ]; then
+    echo "fm-cmux-war-room retire-corpse: workspace '$workspace' still has panes; refusing retirement" >&2
+    return 1
+  fi
+  "$cmux_bin" close-workspace --workspace "$workspace"
+}
+
 main() {
   local cmd="${1:-}"
   [ $# -gt 0 ] && shift
@@ -127,6 +156,7 @@ main() {
     banner) fm_cmux_war_room_banner "$@" ;;
     color-for-harness) fm_cmux_war_room_color_for_harness "$@" ;;
     teardown-surfaces) fm_cmux_war_room_teardown_surfaces "$@" ;;
+    retire-corpse) fm_cmux_war_room_retire_corpse "$@" ;;
     -h|--help|"") fm_cmux_war_room_usage ;;
     *) echo "fm-cmux-war-room: unknown subcommand: $cmd" >&2; fm_cmux_war_room_usage >&2; return 1 ;;
   esac
