@@ -730,3 +730,36 @@ test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
+
+# Pin that every generated brief uses native `gh` for GitHub operations and does
+# not reference the removed gh-axi wrapper. The direct-PR brief must instruct
+# `gh pr create` specifically.
+test_briefs_use_native_gh_not_gh_axi() {
+  local home id brief
+  home="$TMP_ROOT/native-gh-home"
+  mkdir -p "$home/data"
+
+  for id_mode in "gh-nomistakes:no-mistakes" "gh-directpr:direct-PR" "gh-localonly:local-only"; do
+    id=${id_mode%%:*}
+    mode=${id_mode##*:}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$mode" >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    assert_no_grep 'gh-axi' "$brief" "$mode brief must not reference the removed gh-axi wrapper"
+    # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+    assert_grep 'native `gh`' "$brief" "$mode brief must instruct native gh for GitHub operations"
+  done
+
+  # The direct-PR brief must name the exact command workers use to open PRs.
+  brief="$home/data/gh-directpr/brief.md"
+  assert_grep 'gh pr create' "$brief" \
+    "direct-PR brief must instruct gh pr create for opening the PR"
+
+  # Scout and secondmate scaffolds also must not reference gh-axi.
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" gh-scout some-proj --scout >/dev/null 2>&1
+  assert_no_grep 'gh-axi' "$home/data/gh-scout/brief.md" \
+    "scout brief must not reference the removed gh-axi wrapper"
+
+  pass "fm-brief.sh: all scaffolds reference native gh and not gh-axi"
+}
+
+test_briefs_use_native_gh_not_gh_axi
