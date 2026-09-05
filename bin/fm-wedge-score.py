@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
-# Usage: fm-wedge-score.py settle|score [options].
-# JSONL schema: {"ts":"<iso8601 utc>","key":"<key>","window":"<window>","task":"<task>","lane":"<lane>","idle_secs":<int>,"outcome":"resumed|escalated"}.
-# This script is the single owner of the wedge-settlements.jsonl schema.
+# Usage: fm-wedge-score.py settle|score --state <dir> [options].
+# JSONL schema: {"ts":"<iso8601 utc>","window":"<window>","task":"<task>","lane":"<lane>","idle_secs":<int>,"outcome":"resumed|escalated"}.
+# This script is the single owner of the .wedge-settlements.jsonl schema, of the
+# task-to-lane rule, and of the log's size bound. The log is watcher-owned
+# bookkeeping and lives beside .watch-triage.log in the state directory the
+# caller resolves.
+#
+# The graded score is a shadow comparator, not a calibrated one: its healthy
+# sample is right-censored by the fixed timer it shadows (a pane idle past the
+# threshold escalates instead of settling as resumed), so it never observes a
+# legitimately long healthy tail.
 
 import argparse
 import json
@@ -14,15 +22,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from argyle_gates import norm_cdf, norm_ppf
 
+SETTLEMENTS = ".wedge-settlements.jsonl"
+MAX_BYTES = 262144
 
-def _home(value):
-    return value or os.environ.get("FM_HOME", ".")
 
-
-def _lane_for_task(home, task):
+def _lane_for_task(state, task):
     if not task:
         return "unknown"
-    meta = os.path.join(home, "state", f"{task}.meta")
+    meta = os.path.join(state, f"{task}.meta")
     try:
         with open(meta, encoding="utf-8") as handle:
             for line in handle:
@@ -33,34 +40,46 @@ def _lane_for_task(home, task):
     return "unknown"
 
 
+def _trim(path):
+    if os.path.getsize(path) < MAX_BYTES:
+        return
+    kept, size = [], 0
+    with open(path, encoding="utf-8") as handle:
+        for line in reversed(handle.readlines()):
+            size += len(line.encode("utf-8"))
+            if size > MAX_BYTES // 2:
+                break
+            kept.append(line)
+    kept.reverse()
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.writelines(kept)
+    os.replace(tmp, path)
+
+
 def _settle(args):
     try:
-        home = _home(args.home)
-        data_dir = os.path.join(home, "data")
-        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(args.state, exist_ok=True)
         row = {
             "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "key": args.key,
             "window": args.window,
             "task": args.task,
-            "lane": _lane_for_task(home, args.task),
+            "lane": _lane_for_task(args.state, args.task),
             "idle_secs": args.idle_secs,
             "outcome": args.outcome,
         }
-        with open(
-            os.path.join(data_dir, "wedge-settlements.jsonl"),
-            "a",
-            encoding="utf-8",
-        ) as handle:
+        path = os.path.join(args.state, SETTLEMENTS)
+        with open(path, "a", encoding="utf-8") as handle:
             json.dump(row, handle, separators=(",", ":"))
             handle.write("\n")
+        _trim(path)
     except Exception as exc:
         print(f"fm-wedge-score settle: {exc}", file=sys.stderr)
     return 0
 
 
-def _read_rows(home, lane):
-    path = os.path.join(home, "data", "wedge-settlements.jsonl")
+def _read_rows(state, lane):
+    path = os.path.join(state, SETTLEMENTS)
     rows = []
     try:
         with open(path, encoding="utf-8") as handle:
@@ -76,20 +95,37 @@ def _read_rows(home, lane):
     return rows
 
 
+def _escalation_incidents(rows):
+    # A pane that stays wedged re-escalates every threshold, so only the first
+    # escalation of a window since its last resume counts as an incident.
+    unresolved = set()
+    count = 0
+    for row in rows:
+        window = row.get("window", "")
+        if row.get("outcome") == "escalated":
+            if window not in unresolved:
+                unresolved.add(window)
+                count += 1
+        elif row.get("outcome") == "resumed":
+            unresolved.discard(window)
+    return count
+
+
 def _score(args):
-    rows = _read_rows(_home(args.home), args.lane)
+    lane = _lane_for_task(args.state, args.task)
+    rows = _read_rows(args.state, lane)
     healthy = [
         float(row["idle_secs"])
         for row in rows
         if row.get("outcome") == "resumed"
     ]
     n = len(healthy)
-    n_total = len(rows)
-    n_esc = sum(row.get("outcome") == "escalated" for row in rows)
+    n_esc = _escalation_incidents(rows)
+    n_total = n + n_esc
     fixed_flag = args.idle_secs >= args.fixed_threshold
     if n < args.min_obs:
         result = {
-            "lane": args.lane,
+            "lane": lane,
             "n": n,
             "score": None,
             "graded_flag": None,
@@ -106,7 +142,7 @@ def _score(args):
         score = z - norm_ppf(1 - base_rate)
         p_tail = 1 - norm_cdf(z)
         result = {
-            "lane": args.lane,
+            "lane": lane,
             "n": n,
             "n_total": n_total,
             "base_rate": round(base_rate, 4),
@@ -123,12 +159,10 @@ def _score(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--home", default=os.environ.get("FM_HOME", "."))
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     settle = subparsers.add_parser("settle")
-    settle.add_argument("--home", default=None)
-    settle.add_argument("--key", required=True)
+    settle.add_argument("--state", required=True)
     settle.add_argument("--window", required=True)
     settle.add_argument("--task", default="")
     settle.add_argument("--idle-secs", required=True, type=int)
@@ -136,10 +170,10 @@ def main():
     settle.set_defaults(handler=_settle)
 
     score = subparsers.add_parser("score")
-    score.add_argument("--home", default=None)
-    score.add_argument("--lane", required=True)
+    score.add_argument("--state", required=True)
+    score.add_argument("--task", default="")
     score.add_argument("--idle-secs", required=True, type=int)
-    score.add_argument("--fixed-threshold", default=240, type=int)
+    score.add_argument("--fixed-threshold", required=True, type=int)
     score.add_argument("--min-obs", default=8, type=int)
     score.set_defaults(handler=_score)
 

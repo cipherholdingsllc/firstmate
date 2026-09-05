@@ -270,26 +270,21 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # Shadow mode records wedge settlements and logs a graded score beside the fixed
 # timer, but never changes escalation.
 wedge_shadow_settle() {  # <window> <task> <idle-secs> <outcome>
-  local win=$1 task=$2 idle=$3 outcome=$4 key
+  local win=$1 task=$2 idle=$3 outcome=$4
   [ "${FM_WEDGE_SHADOW:-1}" = 1 ] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
-  key=$(printf '%s' "$win" | tr ':/.' '___')
-  "$SCRIPT_DIR/fm-wedge-score.py" settle --home "$FM_HOME" --key "$key" \
+  "$SCRIPT_DIR/fm-wedge-score.py" settle --state "$STATE" \
     --window "$win" --task "$task" --idle-secs "$idle" --outcome "$outcome" \
     >/dev/null 2>&1 || true
 }
 
-wedge_shadow_score() {  # <window> <task> <idle-secs>
-  local task=$2 idle=$3 lane=unknown meta score
+wedge_shadow_score() {  # <task> <idle-secs>
+  local task=$1 idle=$2 score
   [ "${FM_WEDGE_SHADOW:-1}" = 1 ] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
-  meta="$STATE/$task.meta"
-  if [ -n "$task" ] && [ -f "$meta" ]; then
-    lane=$(grep '^project=' "$meta" | cut -d= -f2- || true)
-    [ -n "$lane" ] || lane=unknown
-  fi
-  score=$("$SCRIPT_DIR/fm-wedge-score.py" score --home "$FM_HOME" \
-    --lane "$lane" --idle-secs "$idle" 2>/dev/null) || true
+  score=$("$SCRIPT_DIR/fm-wedge-score.py" score --state "$STATE" \
+    --task "$task" --idle-secs "$idle" \
+    --fixed-threshold "$STALE_ESCALATE_SECS" 2>/dev/null) || true
   [ -n "$score" ] && triage_log "shadow wedge score: $score" || true
 }
 
@@ -332,7 +327,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
           reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
         fi
         wedge_shadow_settle "$win" "$(window_to_task "$win" "$STATE")" "$age" escalated || true
-        wedge_shadow_score "$win" "$(window_to_task "$win" "$STATE")" "$age" || true
+        wedge_shadow_score "$(window_to_task "$win" "$STATE")" "$age" || true
         fm_wake_append stale "$win" "$reason" || exit 1
         rm -f "$since_file"
         wake "$reason"
