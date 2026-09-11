@@ -909,6 +909,40 @@ clear_write_tracking() {  # <window-key>
   rm -f "$STATE/.writing-since-$key" "$STATE/.writing-resurfaced-$key"
 }
 
+# Shadow mode records wedge settlements and logs a graded score beside the fixed
+# timer, but never changes escalation.
+wedge_shadow_settle() {  # <window> <task> <idle-secs> <outcome>
+  local win=$1 task=$2 idle=$3 outcome=$4
+  [ "${FM_WEDGE_SHADOW:-1}" = 1 ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  "$SCRIPT_DIR/fm-wedge-score.py" settle --state "$STATE" \
+    --window "$win" --task "$task" --idle-secs "$idle" --outcome "$outcome" \
+    >/dev/null 2>&1 || true
+}
+
+wedge_shadow_score() {  # <task> <idle-secs>
+  local task=$1 idle=$2 score
+  [ "${FM_WEDGE_SHADOW:-1}" = 1 ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  score=$("$SCRIPT_DIR/fm-wedge-score.py" score --state "$STATE" \
+    --task "$task" --idle-secs "$idle" \
+    --fixed-threshold "$STALE_ESCALATE_SECS" 2>/dev/null) || true
+  [ -n "$score" ] && triage_log "shadow wedge score: $score" || true
+}
+
+wedge_shadow_resumed() {  # <window> <task> <since-file>
+  local win=$1 task=$2 since_file=$3 since idle
+  [ "${FM_WEDGE_SHADOW:-1}" = 1 ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  [ -e "$since_file" ] || return 0
+  since=$(cat "$since_file" 2>/dev/null || true)
+  case "$since" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  idle=$(( $(date +%s) - since ))
+  wedge_shadow_settle "$win" "$task" "$idle" resumed || true
+}
+
 # Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
 # absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
 # watcher restart between recording the hash and recording the timer), or
@@ -944,6 +978,8 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
           reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
         fi
+        wedge_shadow_settle "$win" "$task" "$age" escalated || true
+        wedge_shadow_score "$task" "$age" || true
         fm_wake_append stale "$win" "$reason" || exit 1
         rm -f "$since_file"
         clear_write_tracking "$(window_key "$win")"
@@ -1099,16 +1135,21 @@ clear_pause_state() {  # <window-key>
 # timer and escalation count, and the write-deferral chain. Split out so a caller
 # that must keep a window's DECLARATION-scoped pause state - its .paused-* flag,
 # recheck, and re-surface throttle - can still reset the per-hash half alone.
-clear_stale_hash_tracking() {  # <window-key>
-  local key=$1
+# Optional <window> <task> let shadow mode record the close of a since-file'd
+# idle window as a resumed settlement before the file is removed; callers that
+# pass only the key clear state without recording.
+clear_stale_hash_tracking() {  # <window-key> [window] [task]
+  local key=$1 win=${2-} task=${3-}
   clear_write_tracking "$key"
+  [ -z "$win" ] || wedge_shadow_resumed "$win" "$task" \
+    "$STATE/.stale-since-$key" || true
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
-clear_pause_tracking() {  # <window-key>
-  local key=$1
+clear_pause_tracking() {  # <window-key> [window] [task]
+  local key=$1 win=${2-} task=${3-}
   clear_pause_state "$key"
-  clear_stale_hash_tracking "$key"
+  clear_stale_hash_tracking "$key" "$win" "$task"
 }
 
 # Reconcile a declared pause or captain-held status with authoritative crew state.
@@ -2197,7 +2238,7 @@ EOF
     key=$(window_key "$w")
     last=$(last_status_line "$STATE/$task.status")
     if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then
-      clear_pause_tracking "$key"
+      clear_pause_tracking "$key" "$w" "$task"
     fi
     # An idle secondmate endpoint is healthy by design, so a mate is admitted to
     # the pane-stale path ONLY to serve a status-declared wait's bounded
@@ -2233,7 +2274,7 @@ EOF
         if [ "$kind" = secondmate ]; then
           case "$(pause_state_class "$w" "$task")" in
             paused) handle_paused_stale "$w" "$task" "$h" ;;
-            *)      clear_pause_tracking "$key" ;;
+            *)      clear_pause_tracking "$key" "$w" "$task" ;;
           esac
         elif afk_present; then
           # Daemon owns triage: one-shot per distinct stale hash, as before,
@@ -2324,7 +2365,7 @@ EOF
             task=$(window_to_task "$w" "$STATE")
             case "$(pause_state_class "$w" "$task")" in
               working)
-                clear_pause_tracking "$key"
+                clear_pause_tracking "$key" "$w" "$task"
                 printf '%s' "$h" > "$sf"
                 date +%s > "$ssf"
                 triage_log "absorbed non-terminal stale (provably working): $w"
@@ -2361,6 +2402,7 @@ EOF
         if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
           busy_turn_bound_check "$w" "$task" "$h" "$ssf" "$ewf" && paused_bound=0
         else
+          wedge_shadow_resumed "$w" "$task" "$ssf" || true
           rm -f "$ssf" "$ewf"
           clear_write_tracking "$key"
         fi
@@ -2369,7 +2411,7 @@ EOF
         # recorded it, or the re-surface throttle it depends on would be erased and
         # the pause would re-surface every poll instead of once per long cadence.
         if [ "$paused_bound" -ne 0 ] && [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused_or_captain_held "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
-          clear_pause_tracking "$key"
+          clear_pause_tracking "$key" "$w" "$task"
         fi
       fi
     else
@@ -2379,6 +2421,7 @@ EOF
       if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
         busy_turn_bound_check "$w" "$task" "$h" "$ssf" "$ewf" && paused_bound=0
       else
+        wedge_shadow_resumed "$w" "$task" "$ssf" || true
         rm -f "$ssf" "$ewf"
         clear_write_tracking "$key"
       fi
@@ -2394,13 +2437,13 @@ EOF
           # same wait a fresh window on every tick - the first sight of each new
           # hash reaches surface_nonterminal_stale below, so the whole declared
           # wait would re-alarm far inside PAUSE_RESURFACE_SECS.
-          none)   clear_stale_hash_tracking "$key" ;;
-          *)      clear_pause_tracking "$key" ;;
+          none)   clear_stale_hash_tracking "$key" "$w" "$task" ;;
+          *)      clear_pause_tracking "$key" "$w" "$task" ;;
         esac
       elif [ "$paused_bound" -ne 0 ] && [ -e "$pf" ]; then
         # Same rule as the stable-hash branch: never clear pause bookkeeping the
         # declared-pause cadence recorded on this very poll.
-        clear_pause_tracking "$key"
+        clear_pause_tracking "$key" "$w" "$task"
       fi
     fi
   done < <(recorded_windows)
