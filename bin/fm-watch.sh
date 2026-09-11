@@ -267,6 +267,40 @@ recorded_windows() {
 # below).
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 
+# Shadow mode records wedge settlements and logs a graded score beside the fixed
+# timer, but never changes escalation.
+wedge_shadow_settle() {  # <window> <task> <idle-secs> <outcome>
+  local win=$1 task=$2 idle=$3 outcome=$4
+  [ "${FM_WEDGE_SHADOW:-1}" = 1 ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  "$SCRIPT_DIR/fm-wedge-score.py" settle --state "$STATE" \
+    --window "$win" --task "$task" --idle-secs "$idle" --outcome "$outcome" \
+    >/dev/null 2>&1 || true
+}
+
+wedge_shadow_score() {  # <task> <idle-secs>
+  local task=$1 idle=$2 score
+  [ "${FM_WEDGE_SHADOW:-1}" = 1 ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  score=$("$SCRIPT_DIR/fm-wedge-score.py" score --state "$STATE" \
+    --task "$task" --idle-secs "$idle" \
+    --fixed-threshold "$STALE_ESCALATE_SECS" 2>/dev/null) || true
+  [ -n "$score" ] && triage_log "shadow wedge score: $score" || true
+}
+
+wedge_shadow_resumed() {  # <window> <task> <since-file>
+  local win=$1 task=$2 since_file=$3 since idle
+  [ "${FM_WEDGE_SHADOW:-1}" = 1 ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  [ -e "$since_file" ] || return 0
+  since=$(cat "$since_file" 2>/dev/null || true)
+  case "$since" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  idle=$(( $(date +%s) - since ))
+  wedge_shadow_settle "$win" "$task" "$idle" resumed || true
+}
+
 # Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
 # absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
 # watcher restart between recording the hash and recording the timer), or
@@ -292,6 +326,8 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
           reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
         fi
+        wedge_shadow_settle "$win" "$(window_to_task "$win" "$STATE")" "$age" escalated || true
+        wedge_shadow_score "$(window_to_task "$win" "$STATE")" "$age" || true
         fm_wake_append stale "$win" "$reason" || exit 1
         rm -f "$since_file"
         wake "$reason"
@@ -359,6 +395,8 @@ clear_pause_tracking() {  # <window>
   key=${key//\//_}
   key=${key//./_}
   clear_pause_state "$win"
+  wedge_shadow_resumed "$win" "$(window_to_task "$win" "$STATE")" \
+    "$STATE/.stale-since-$key" || true
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
@@ -1061,6 +1099,7 @@ EOF
         if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
           wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
         else
+          wedge_shadow_resumed "$w" "$task" "$ssf" || true
           rm -f "$ssf" "$ewf"
         fi
         if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused_or_captain_held "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
@@ -1073,6 +1112,7 @@ EOF
       if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
         wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
       else
+        wedge_shadow_resumed "$w" "$task" "$ssf" || true
         rm -f "$ssf" "$ewf"
       fi
       task=$(window_to_task "$w" "$STATE")
